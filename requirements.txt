@@ -1,0 +1,14 @@
+aiohttp
+beautifulsoup4
+dnspython
+openpyxl
+pandas
+Pillow
+python-Levenshtein
+python-whois
+joblib
+numpy
+scikit-learn==1.8.0
+tldextract
+tqdm
+playwright

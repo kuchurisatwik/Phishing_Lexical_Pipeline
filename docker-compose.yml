@@ -1,0 +1,22 @@
+version: '3.8'
+
+services:
+  phishing-pipeline:
+    build: .
+    image: phishing-lexical-pipeline:latest
+    container_name: phishing_pipeline
+    environment:
+      # These paths match the container's internal structure
+      - PIPELINE_INPUT_DIR=/app/input/target
+      - PIPELINE_CSE_DIR=/app/input/cse
+      - PIPELINE_OUTPUT_DIR=/app/output
+      # Optional concurrency tuning (uncomment and adjust as needed)
+      # - PIPELINE_CONCURRENCY=12
+      # - PIPELINE_DNS_CONCURRENCY=32
+    volumes:
+      # Map your local Windows folders to the container
+      # Syntax is: <local_path>:<container_path>
+      - ./input:/app/input:ro      # Read-only mount for safety
+      - ./output:/app/output       # Read-write mount for generating reports
+      - ./logs:/app/logs           # Unified pipeline log (overwritten each run)
+    restart: "no" # Runs once and exits. Set to "always" if running as a service
