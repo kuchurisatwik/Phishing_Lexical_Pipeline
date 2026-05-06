@@ -156,10 +156,11 @@ class PageEvidence:
     logo_brand_domain_mismatch: int = 0
     visual_brand_domain_mismatch: int = 0
     favicon_hash: str = ""
-    favicon_hash_matches_target_brand: int = 0
-    favicon_hash_matches_known_phish: int = 0
+    favicon_similarity_score: float = 0.0
+    logo_hash: str = ""
+    logo_similarity_score: float = 0.0
     html_dom_hash: str = ""
-    html_dom_hash_matches_known_phish: int = 0
+    html_dom_similarity_score: float = 0.0
     same_html_hash_domain_count_7d: int = 0
     status: str = "unknown"
 
@@ -598,6 +599,22 @@ def find_favicon_url(page_url: str, html: str) -> str:
     return urljoin(page_url, "/favicon.ico")
 
 
+def find_logo_url(page_url: str, html: str) -> str:
+    if not html:
+        return ""
+    soup = BeautifulSoup(html, "html.parser")
+    for img in soup.find_all("img"):
+        attrs = " ".join(
+            _clean_text(img.get(attr))
+            for attr in ("alt", "src", "class", "id", "title")
+        ).lower()
+        if "logo" in attrs:
+            src = img.get("src")
+            if src:
+                return urljoin(page_url, src)
+    return ""
+
+
 _HASH_BITS = 64
 _PHASH_IMAGE_SIZE = 32
 _PHASH_HASH_SIZE = 8
@@ -692,24 +709,31 @@ def _hex_hamming_distance(left: str, right: str) -> int | None:
         return 0 if left == right else None
 
 
-def _hash_matches(candidate: str, references: set[str], max_distance: int) -> bool:
+def _hash_similarity_score(candidate: str, references: set[str], max_bits: int) -> float:
     candidate = _clean_text(candidate).lower()
-    if not candidate:
-        return False
+    if not candidate or not references:
+        return 0.0
+    best_score = 0.0
     for reference in references:
         reference = _clean_text(reference).lower()
         if not reference:
             continue
         if candidate == reference:
-            return True
+            return 1.0
         distance = _hex_hamming_distance(candidate, reference)
-        if distance is not None and distance <= max_distance:
-            return True
-    return False
+        if distance is not None:
+            score = max(0.0, 1.0 - (distance / max_bits))
+            if score > best_score:
+                best_score = score
+    return best_score
 
 
 def favicon_hash(favicon_bytes: bytes | None, favicon_url: str = "") -> str:
     return _image_phash(favicon_bytes)
+
+
+def logo_hash(logo_bytes: bytes | None) -> str:
+    return _image_phash(logo_bytes)
 
 
 def dom_hash(html: str) -> str:
@@ -734,10 +758,11 @@ def analyze_page(
     matched_brand_domain: str,
     favicon_bytes: bytes | None = None,
     favicon_url: str = "",
+    logo_bytes: bytes | None = None,
     html_dom_hash: str = "",
-    known_brand_favicon_hashes: dict[str, set[str]] | None = None,
-    known_phish_favicon_hashes: set[str] | None = None,
-    known_phish_dom_hashes: set[str] | None = None,
+    brand_favicon_hashes: dict[str, set[str]] | None = None,
+    brand_logo_hashes: dict[str, set[str]] | None = None,
+    brand_dom_hashes: dict[str, set[str]] | None = None,
 ) -> PageEvidence:
     html = fetch.html or ""
     if not html:
@@ -801,8 +826,17 @@ def analyze_page(
     )
 
     fav_hash = favicon_hash(favicon_bytes, favicon_url)
-    brand_hashes = known_brand_favicon_hashes or {}
-    target_hashes: set[str] = set()
+    log_hash = logo_hash(logo_bytes)
+    html_hash = html_dom_hash or dom_hash(html)
+
+    target_fav_hashes: set[str] = set()
+    target_logo_hashes: set[str] = set()
+    target_dom_hashes: set[str] = set()
+
+    brand_favs = brand_favicon_hashes or {}
+    brand_logos = brand_logo_hashes or {}
+    brand_doms = brand_dom_hashes or {}
+
     for key in {
         target_registered,
         normalize_hostname(matched_brand_domain or context.target_domain),
@@ -810,10 +844,9 @@ def analyze_page(
         normalize_hostname(context.target_domain),
     }:
         if key:
-            target_hashes.update(brand_hashes.get(key, set()))
-    known_phish_favs = known_phish_favicon_hashes or set()
-    html_hash = html_dom_hash or dom_hash(html)
-    known_phish_doms = known_phish_dom_hashes or set()
+            target_fav_hashes.update(brand_favs.get(key, set()))
+            target_logo_hashes.update(brand_logos.get(key, set()))
+            target_dom_hashes.update(brand_doms.get(key, set()))
 
     return PageEvidence(
         page_render_success=int(fetch.fetch_success and bool(html.strip())),
@@ -826,12 +859,14 @@ def analyze_page(
         logo_brand_domain_mismatch=visual_mismatch,
         visual_brand_domain_mismatch=visual_mismatch,
         favicon_hash=fav_hash,
-        favicon_hash_matches_target_brand=int(_hash_matches(fav_hash, target_hashes, IMAGE_PHASH_HAMMING_THRESHOLD)),
-        favicon_hash_matches_known_phish=int(_hash_matches(fav_hash, known_phish_favs, IMAGE_PHASH_HAMMING_THRESHOLD)),
+        favicon_similarity_score=round(_hash_similarity_score(fav_hash, target_fav_hashes, _HASH_BITS), 4),
+        logo_hash=log_hash,
+        logo_similarity_score=round(_hash_similarity_score(log_hash, target_logo_hashes, _HASH_BITS), 4),
         html_dom_hash=html_hash,
-        html_dom_hash_matches_known_phish=int(_hash_matches(html_hash, known_phish_doms, TEXT_SIMHASH_HAMMING_THRESHOLD)),
+        html_dom_similarity_score=round(_hash_similarity_score(html_hash, target_dom_hashes, _HASH_BITS), 4),
         status="success",
     )
+
 
 
 def _binary_url_features(url: str, domain: str) -> dict[str, Any]:
@@ -887,11 +922,12 @@ def extract_features_from_prefetch(
     hosting_result: HostingResult | None = None,
     favicon_bytes: bytes | None = None,
     favicon_url: str = "",
+    logo_bytes: bytes | None = None,
     html_dom_hash: str = "",
     ip_brand_counts: dict[str, int] | None = None,
-    known_brand_favicon_hashes: dict[str, set[str]] | None = None,
-    known_phish_favicon_hashes: set[str] | None = None,
-    known_phish_dom_hashes: set[str] | None = None,
+    brand_favicon_hashes: dict[str, set[str]] | None = None,
+    brand_logo_hashes: dict[str, set[str]] | None = None,
+    brand_dom_hashes: dict[str, set[str]] | None = None,
 ) -> dict[str, Any]:
     url = ensure_url(context.url)
     domain = normalize_hostname(context.detected_domain or url)
@@ -934,10 +970,11 @@ def extract_features_from_prefetch(
         lexical["matched_brand_domain"],
         favicon_bytes,
         favicon_url,
+        logo_bytes,
         html_dom_hash,
-        known_brand_favicon_hashes,
-        known_phish_favicon_hashes,
-        known_phish_dom_hashes,
+        brand_favicon_hashes,
+        brand_logo_hashes,
+        brand_dom_hashes,
     )
 
     ips = [ip for ip in dns.resolved_ips.split(";") if ip]
@@ -994,10 +1031,11 @@ def extract_features_from_prefetch(
         "logo_brand_domain_mismatch": page.logo_brand_domain_mismatch,
         "visual_brand_domain_mismatch": page.visual_brand_domain_mismatch,
         "favicon_hash": page.favicon_hash,
-        "favicon_hash_matches_target_brand": page.favicon_hash_matches_target_brand,
-        "favicon_hash_matches_known_phish": page.favicon_hash_matches_known_phish,
+        "favicon_similarity_score": page.favicon_similarity_score,
+        "logo_hash": page.logo_hash,
+        "logo_similarity_score": page.logo_similarity_score,
         "html_dom_hash": page.html_dom_hash,
-        "html_dom_hash_matches_known_phish": page.html_dom_hash_matches_known_phish,
+        "html_dom_similarity_score": page.html_dom_similarity_score,
         "same_html_hash_domain_count_7d": page.same_html_hash_domain_count_7d,
         "fetch_status_code": fetch.status_code,
         "fetch_error": fetch.error,
@@ -1027,7 +1065,6 @@ def classify_features(row: dict[str, Any]) -> dict[str, Any]:
     password = int(row.get("has_password_input") or 0) == 1
     brand_claim = int(row.get("brand_token_or_logo_present") or 0) == 1
     visual_mismatch = int(row.get("visual_brand_domain_mismatch") or 0) == 1
-    phish_favicon = int(row.get("favicon_hash_matches_known_phish") or 0) == 1
     campaign_count = int(row.get("same_html_hash_domain_count_7d") or 0)
     source_label = _source_label_normalized(str(row.get("source_label", "")))
 
@@ -1045,7 +1082,6 @@ def classify_features(row: dict[str, Any]) -> dict[str, Any]:
         and (
             (password and brand_claim)
             or visual_mismatch
-            or phish_favicon
         )
     )
 
@@ -1066,10 +1102,8 @@ def classify_features(row: dict[str, Any]) -> dict[str, Any]:
         status = "phishing"
         if password and brand_claim:
             reason = "password input plus brand token/logo evidence"
-        elif visual_mismatch:
-            reason = "visual brand match on unauthorized domain"
         else:
-            reason = "favicon hash matches known phishing hash"
+            reason = "visual brand match on unauthorized domain"
         label = 1
     elif source_label == "phishing":
         status = "source_verified_phishing"

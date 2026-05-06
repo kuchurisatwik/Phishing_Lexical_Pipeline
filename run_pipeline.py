@@ -37,8 +37,10 @@ from extract.feature_extractor import (
     ensure_url,
     extract_features_from_prefetch,
     favicon_hash,
+    logo_hash,
     finalize_feature_rows,
     find_favicon_url,
+    find_logo_url,
     is_official_domain,
     normalize_hostname,
     probe_tls,
@@ -116,15 +118,15 @@ def _float_env(name: str, default: float) -> float:
         return default
 
 
-DEFAULT_IO_CONCURRENCY = _int_env("PIPELINE_CONCURRENCY", 12)
-DNS_CONCURRENCY = _int_env("PIPELINE_DNS_CONCURRENCY", max(32, DEFAULT_IO_CONCURRENCY * 2))
+DEFAULT_IO_CONCURRENCY = _int_env("PIPELINE_CONCURRENCY", max(32, (os.cpu_count() or 4) * 8))
+DNS_CONCURRENCY = _int_env("PIPELINE_DNS_CONCURRENCY", max(64, DEFAULT_IO_CONCURRENCY * 2))
 HTTP_CONCURRENCY = _int_env("PIPELINE_HTTP_CONCURRENCY", DEFAULT_IO_CONCURRENCY)
-RDAP_CONCURRENCY = _int_env("PIPELINE_RDAP_CONCURRENCY", max(20, DEFAULT_IO_CONCURRENCY))
-WHOIS_CONCURRENCY = _int_env("PIPELINE_WHOIS_CONCURRENCY", 2)
-WHOIS_DELAY = _float_env("PIPELINE_WHOIS_DELAY", 0.5)
-TLS_CONCURRENCY = _int_env("PIPELINE_TLS_CONCURRENCY", max(4, DEFAULT_IO_CONCURRENCY // 2))
-ASN_CONCURRENCY = _int_env("PIPELINE_ASN_CONCURRENCY", max(4, DEFAULT_IO_CONCURRENCY // 2))
-THREAD_WORKERS = _int_env("PIPELINE_THREAD_WORKERS", min(4, (os.cpu_count() or 1)))
+RDAP_CONCURRENCY = _int_env("PIPELINE_RDAP_CONCURRENCY", max(32, DEFAULT_IO_CONCURRENCY))
+WHOIS_CONCURRENCY = _int_env("PIPELINE_WHOIS_CONCURRENCY", max(4, (os.cpu_count() or 4)))
+WHOIS_DELAY = _float_env("PIPELINE_WHOIS_DELAY", 0.1)
+TLS_CONCURRENCY = _int_env("PIPELINE_TLS_CONCURRENCY", max(16, DEFAULT_IO_CONCURRENCY // 2))
+ASN_CONCURRENCY = _int_env("PIPELINE_ASN_CONCURRENCY", max(16, DEFAULT_IO_CONCURRENCY // 2))
+THREAD_WORKERS = _int_env("PIPELINE_THREAD_WORKERS", max(8, (os.cpu_count() or 4) * 2))
 HTTP_TIMEOUT = _int_env("PIPELINE_HTTP_TIMEOUT", 10)
 DNS_TIMEOUT = _float_env("PIPELINE_DNS_TIMEOUT", DEFAULT_DNS_TIMEOUT)
 DNS_LIFETIME = _float_env("PIPELINE_DNS_LIFETIME", DEFAULT_DNS_LIFETIME)
@@ -170,9 +172,9 @@ OUTPUT_COLUMNS = [
     "logo_detected",
     "logo_brand_matches_target_brand",
     "logo_brand_domain_mismatch",
-    "favicon_hash_matches_target_brand",
-    "favicon_hash_matches_known_phish",
-    "html_dom_hash_matches_known_phish",
+    "favicon_similarity_score",
+    "logo_similarity_score",
+    "html_dom_similarity_score",
     "high_lexical_similarity",
     "page_fetch_success",
     "no_login_form",
@@ -224,13 +226,10 @@ BOOLEAN_COLUMNS = {
     "cname_exists",
     "dns_check_pass",
     "dns_resolves_to_ip",
-    "favicon_hash_matches_known_phish",
-    "favicon_hash_matches_target_brand",
     "form_action_external",
     "has_login_form",
     "has_password_input",
     "high_lexical_similarity",
-    "html_dom_hash_matches_known_phish",
     "https_enabled",
     "ip_seen_with_many_brands",
     "logo_brand_domain_mismatch",
@@ -312,9 +311,20 @@ def load_cse_records() -> list[CseRecord]:
         raise FileNotFoundError(f"CSE list not found: {CSE_FILE}")
 
     if CSE_FILE.lower().endswith((".xlsx", ".xls")):
-        df = pd.read_excel(CSE_FILE)
+        csv_path = CSE_FILE.rsplit('.', 1)[0] + ".csv"
+        if not os.path.exists(csv_path):
+            log.info("Converting %s to %s before loading", os.path.basename(CSE_FILE), os.path.basename(csv_path))
+            df = pd.read_excel(CSE_FILE)
+            df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+        try:
+            df = pd.read_csv(csv_path, encoding="utf-8-sig")
+        except UnicodeDecodeError:
+            df = pd.read_csv(csv_path, encoding="latin1")
     else:
-        df = pd.read_csv(CSE_FILE)
+        try:
+            df = pd.read_csv(CSE_FILE, encoding="utf-8-sig")
+        except UnicodeDecodeError:
+            df = pd.read_csv(CSE_FILE, encoding="latin1")
 
     records: dict[str, CseRecord] = {}
     for _, row in df.iterrows():
@@ -444,7 +454,15 @@ def load_input_contexts(input_dir: str) -> list[UrlContext]:
                 except UnicodeDecodeError:
                     df = pd.read_csv(path, encoding="latin1")
             else:
-                df = pd.read_excel(path)
+                csv_path = path.rsplit('.', 1)[0] + ".csv"
+                if not os.path.exists(csv_path):
+                    log.info("Converting %s to %s before loading", file_name, os.path.basename(csv_path))
+                    df = pd.read_excel(path)
+                    df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+                try:
+                    df = pd.read_csv(csv_path, encoding="utf-8-sig")
+                except UnicodeDecodeError:
+                    df = pd.read_csv(csv_path, encoding="latin1")
         except Exception as exc:
             log.warning("Failed to read %s: %s", file_name, exc)
             continue
@@ -672,24 +690,31 @@ def _load_hash_set(path: str) -> set[str]:
         return {line.strip().lower() for line in file if line.strip()}
 
 
-def load_known_hashes() -> tuple[dict[str, set[str]], set[str], set[str]]:
-    phish_favicons = _load_hash_set(os.path.join(DATA_DIR, "known_phish_favicon_hashes.txt"))
-    phish_doms = _load_hash_set(os.path.join(DATA_DIR, "known_phish_dom_hashes.txt"))
+def load_known_hashes() -> tuple[dict[str, set[str]], dict[str, set[str]], dict[str, set[str]]]:
     brand_favicons = defaultdict(set)
-    brand_path = os.path.join(DATA_DIR, "brand_favicon_hashes.csv")
-    if os.path.exists(brand_path):
-        with open(brand_path, "r", encoding="utf-8") as file:
-            reader = csv.DictReader(file)
-            for row in reader:
-                raw_domain = row.get("domain", "")
-                domain = registered_domain(raw_domain)
-                host = normalize_hostname(raw_domain)
-                fav_hash = (row.get("favicon_hash") or "").strip().lower()
-                if domain and fav_hash:
-                    brand_favicons[domain].add(fav_hash)
-                if host and fav_hash:
-                    brand_favicons[host].add(fav_hash)
-    return dict(brand_favicons), phish_favicons, phish_doms
+    brand_logos = defaultdict(set)
+    brand_doms = defaultdict(set)
+    
+    def _load_into(filename, hash_col, target_dict):
+        path = os.path.join(DATA_DIR, filename)
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as file:
+                reader = csv.DictReader(file)
+                for row in reader:
+                    raw_domain = row.get("domain", "")
+                    domain = registered_domain(raw_domain)
+                    host = normalize_hostname(raw_domain)
+                    val_hash = (row.get(hash_col) or "").strip().lower()
+                    if domain and val_hash:
+                        target_dict[domain].add(val_hash)
+                    if host and val_hash:
+                        target_dict[host].add(val_hash)
+                        
+    _load_into("brand_favicon_hashes.csv", "favicon_hash", brand_favicons)
+    _load_into("brand_logo_hashes.csv", "logo_hash", brand_logos)
+    _load_into("brand_dom_hashes.csv", "html_dom_hash", brand_doms)
+    
+    return dict(brand_favicons), dict(brand_logos), dict(brand_doms)
 
 
 def load_ip_asn_cache() -> dict[str, str]:
@@ -740,6 +765,10 @@ def cse_reference_files_exist(data_dir: str = DATA_DIR) -> bool:
         os.path.join(data_dir, "brand_dom_hashes.csv"),
         DOM_HASH_ALGORITHM,
         "html_dom_hash",
+    ) and _reference_file_uses_algorithm(
+        os.path.join(data_dir, "brand_logo_hashes.csv"),
+        FAVICON_HASH_ALGORITHM,
+        "logo_hash",
     )
 
 
@@ -747,8 +776,8 @@ async def extract_cse_reference_hashes(
     cse_domains: list[str],
     data_dir: str = DATA_DIR,
     force: bool = False,
-) -> tuple[list[dict], list[dict]]:
-    """Fetch official CSE pages once and write brand favicon/DOM references."""
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """Fetch official CSE pages once and write brand favicon/logo/DOM references."""
     if not IMAGE_PHASH_AVAILABLE:
         raise RuntimeError(
             "Pillow is required to compute phash64 favicon hashes. "
@@ -758,12 +787,17 @@ async def extract_cse_reference_hashes(
     os.makedirs(data_dir, exist_ok=True)
     favicon_path = os.path.join(data_dir, "brand_favicon_hashes.csv")
     dom_path = os.path.join(data_dir, "brand_dom_hashes.csv")
+    logo_path = os.path.join(data_dir, "brand_logo_hashes.csv")
+    
     if not force and cse_reference_files_exist(data_dir):
-        return [], []
+        return [], [], []
 
     domains = sorted({normalize_hostname(domain) for domain in cse_domains if normalize_hostname(domain)})
     favicon_rows = []
     dom_rows = []
+    logo_rows = []
+    failed_domains = []
+    
     http_sem = asyncio.Semaphore(min(HTTP_CONCURRENCY, 25))
     connector = aiohttp.TCPConnector(limit=min(HTTP_CONCURRENCY, 25), ttl_dns_cache=300)
 
@@ -778,21 +812,35 @@ async def extract_cse_reference_hashes(
             )
         },
     ) as session:
-        async def process_domain(domain: str) -> tuple[dict, dict]:
+        async def process_domain(domain: str) -> tuple[str, dict, dict, dict]:
             fetch = await fetch_html(session, f"https://{domain}", http_sem)
             if not fetch.fetch_success:
                 fetch = await fetch_html(session, f"http://{domain}", http_sem)
+            
             fav_url = find_favicon_url(fetch.final_url or f"https://{domain}", fetch.html)
             fav_bytes = await fetch_binary(session, fav_url, http_sem)
             fav_hash = favicon_hash(fav_bytes, "")
+            
+            logo_url = find_logo_url(fetch.final_url or f"https://{domain}", fetch.html)
+            logo_bytes = await fetch_binary(session, logo_url, http_sem)
+            log_hash = logo_hash(logo_bytes)
+            
             page_hash = await asyncio.to_thread(dom_hash, fetch.html)
             status = fetch.status if fetch.fetch_success else "fetch_failed"
             return (
+                domain,
                 {
                     "domain": domain,
                     "favicon_hash": fav_hash,
                     "hash_algorithm": FAVICON_HASH_ALGORITHM,
                     "status": "success" if fav_hash else ("image_hash_failed" if fetch.fetch_success else status),
+                    "final_url": fetch.final_url or "unknown",
+                },
+                {
+                    "domain": domain,
+                    "logo_hash": log_hash,
+                    "hash_algorithm": FAVICON_HASH_ALGORITHM,
+                    "status": "success" if log_hash else ("image_hash_failed" if fetch.fetch_success else status),
                     "final_url": fetch.final_url or "unknown",
                 },
                 {
@@ -806,21 +854,108 @@ async def extract_cse_reference_hashes(
 
         results = await asyncio.gather(*(process_domain(domain) for domain in domains))
 
-    for fav_row, dom_row in results:
-        favicon_rows.append(fav_row)
-        dom_rows.append(dom_row)
+    for domain, fav_row, logo_row, dom_row in results:
+        if fav_row["status"] != "success" or dom_row["status"] != "success" or not dom_row["html_dom_hash"]:
+            failed_domains.append(domain)
+        else:
+            favicon_rows.append(fav_row)
+            logo_rows.append(logo_row)
+            dom_rows.append(dom_row)
+
+    if failed_domains:
+        from playwright.async_api import async_playwright
+        log.info("Playwright fallback for %d failed domains", len(failed_domains))
+        pw_sem = asyncio.Semaphore(10)
+        async def pw_process_domain(domain: str, p):
+            async with pw_sem:
+                browser = await p.chromium.launch(headless=True)
+                try:
+                    page = await browser.new_page()
+                    await page.goto(f"https://{domain}", wait_until="networkidle", timeout=10000)
+                    html = await page.content()
+                    final_url = page.url
+                    fav_url = find_favicon_url(final_url, html)
+                    logo_url = find_logo_url(final_url, html)
+                    
+                    async with aiohttp.ClientSession() as pw_sess:
+                        fav_bytes = await fetch_binary(pw_sess, fav_url)
+                        logo_bytes = await fetch_binary(pw_sess, logo_url)
+                    
+                    fav_hash = favicon_hash(fav_bytes, "")
+                    log_hash = logo_hash(logo_bytes)
+                    page_hash = await asyncio.to_thread(dom_hash, html)
+                    
+                    return (
+                        domain,
+                        {
+                            "domain": domain,
+                            "favicon_hash": fav_hash,
+                            "hash_algorithm": FAVICON_HASH_ALGORITHM,
+                            "status": "success" if fav_hash else "image_hash_failed",
+                            "final_url": final_url,
+                        },
+                        {
+                            "domain": domain,
+                            "logo_hash": log_hash,
+                            "hash_algorithm": FAVICON_HASH_ALGORITHM,
+                            "status": "success" if log_hash else "image_hash_failed",
+                            "final_url": final_url,
+                        },
+                        {
+                            "domain": domain,
+                            "html_dom_hash": page_hash,
+                            "hash_algorithm": DOM_HASH_ALGORITHM,
+                            "status": "success" if page_hash else "fetch_failed",
+                            "final_url": final_url,
+                        },
+                    )
+                except Exception as exc:
+                    return (
+                        domain,
+                        {
+                            "domain": domain,
+                            "favicon_hash": "",
+                            "hash_algorithm": FAVICON_HASH_ALGORITHM,
+                            "status": "fetch_failed",
+                            "final_url": "unknown",
+                        },
+                        {
+                            "domain": domain,
+                            "logo_hash": "",
+                            "hash_algorithm": FAVICON_HASH_ALGORITHM,
+                            "status": "fetch_failed",
+                            "final_url": "unknown",
+                        },
+                        {
+                            "domain": domain,
+                            "html_dom_hash": "",
+                            "hash_algorithm": DOM_HASH_ALGORITHM,
+                            "status": "fetch_failed",
+                            "final_url": "unknown",
+                        },
+                    )
+                finally:
+                    await browser.close()
+                    
+        async with async_playwright() as p:
+            pw_results = await asyncio.gather(*(pw_process_domain(domain, p) for domain in failed_domains))
+            for domain, fav_row, logo_row, dom_row in pw_results:
+                favicon_rows.append(fav_row)
+                logo_rows.append(logo_row)
+                dom_rows.append(dom_row)
 
     write_csv(favicon_path, favicon_rows, ["domain", "favicon_hash", "hash_algorithm", "status", "final_url"])
+    write_csv(logo_path, logo_rows, ["domain", "logo_hash", "hash_algorithm", "status", "final_url"])
     write_csv(dom_path, dom_rows, ["domain", "html_dom_hash", "hash_algorithm", "status", "final_url"])
-    return favicon_rows, dom_rows
+    return favicon_rows, logo_rows, dom_rows
 
 
 def ensure_cse_reference_hashes(cse_domains: list[str]) -> None:
     if cse_reference_files_exist(DATA_DIR):
         return
     log.info("CSE hash reference files missing or not phash64/simhash64; extracting official references...")
-    favicon_rows, dom_rows = asyncio.run(extract_cse_reference_hashes(cse_domains))
-    log.info("CSE references written: %d favicon rows, %d DOM rows", len(favicon_rows), len(dom_rows))
+    favicon_rows, logo_rows, dom_rows = asyncio.run(extract_cse_reference_hashes(cse_domains))
+    log.info("CSE references written: %d favicon rows, %d logo rows, %d DOM rows", len(favicon_rows), len(logo_rows), len(dom_rows))
 
 
 def _cross_domain_redirect_count(urls: list[str]) -> int:
@@ -1054,15 +1189,20 @@ class AsyncFeatureCache:
             self.http_tasks[key] = asyncio.create_task(fetch_html(self.session, key, self.http_sem))
         return self.http_tasks[key]
 
-    def favicon(self, page_url: str, html: str) -> asyncio.Task[tuple[str, bytes]]:
+    def favicon_and_logo(self, page_url: str, html: str) -> asyncio.Task[tuple[str, bytes, bytes]]:
         origin = _origin(page_url)
         if origin not in self.favicon_tasks:
             favicon_url = find_favicon_url(page_url, html)
-            self.favicon_tasks[origin] = asyncio.create_task(self._favicon(favicon_url))
+            logo_url = find_logo_url(page_url, html)
+            self.favicon_tasks[origin] = asyncio.create_task(self._favicon_and_logo(favicon_url, logo_url))
         return self.favicon_tasks[origin]
 
-    async def _favicon(self, favicon_url: str) -> tuple[str, bytes]:
-        return favicon_url, await fetch_binary(self.session, favicon_url, self.http_sem)
+    async def _favicon_and_logo(self, favicon_url: str, logo_url: str) -> tuple[str, bytes, bytes]:
+        fav_bytes, log_bytes = await asyncio.gather(
+            fetch_binary(self.session, favicon_url, self.http_sem),
+            fetch_binary(self.session, logo_url, self.http_sem),
+        )
+        return favicon_url, fav_bytes, log_bytes
 
     def html_dom_hash(self, final_url: str, html: str) -> asyncio.Task[str]:
         key = ensure_url(final_url)
@@ -1093,15 +1233,15 @@ async def process_context(
     cse_domains: list[str],
     ip_brand_counts: dict[str, int],
     known_brand_favicon_hashes: dict[str, set[str]],
-    known_phish_favicon_hashes: set[str],
-    known_phish_dom_hashes: set[str],
+    known_brand_logo_hashes: dict[str, set[str]],
+    known_brand_dom_hashes: dict[str, set[str]],
 ) -> tuple[int, dict]:
     try:
         dns_task = cache.dns(context)
         rdap_task = cache.registration(context)
         tls_task = cache.tls(context)
         fetch = await cache.http(context.url)
-        favicon_url, favicon_bytes = await cache.favicon(fetch.final_url or context.url, fetch.html)
+        favicon_url, favicon_bytes, logo_bytes = await cache.favicon_and_logo(fetch.final_url or context.url, fetch.html)
         html_hash = await cache.html_dom_hash(fetch.final_url or context.url, fetch.html)
         dns_result = await dns_task
         asn_task = cache.asn(dns_result)
@@ -1120,11 +1260,12 @@ async def process_context(
             hosting_result,
             favicon_bytes,
             favicon_url,
+            logo_bytes,
             html_hash,
             ip_brand_counts,
             known_brand_favicon_hashes,
-            known_phish_favicon_hashes,
-            known_phish_dom_hashes,
+            known_brand_logo_hashes,
+            known_brand_dom_hashes,
         )
         row["rdap_status"] = _stage_status(getattr(domain_info, "rdap_status", "unknown"))
         row["whois_status"] = _stage_status(getattr(domain_info, "whois_status", "unknown"))
@@ -1150,8 +1291,8 @@ async def run_pipeline_async(
     cse_domains: list[str],
     ip_brand_counts: dict[str, int],
     known_brand_favicon_hashes: dict[str, set[str]],
-    known_phish_favicon_hashes: set[str],
-    known_phish_dom_hashes: set[str],
+    known_brand_logo_hashes: dict[str, set[str]],
+    known_brand_dom_hashes: dict[str, set[str]],
 ) -> list[dict]:
     total = len(contexts)
     log.info(
@@ -1219,8 +1360,8 @@ async def run_pipeline_async(
                     cse_domains,
                     ip_brand_counts,
                     known_brand_favicon_hashes,
-                    known_phish_favicon_hashes,
-                    known_phish_dom_hashes,
+                    known_brand_logo_hashes,
+                    known_brand_dom_hashes,
                 )
             finally:
                 pbar.update(1)
@@ -1263,15 +1404,15 @@ def run_extraction_pipeline(contexts: list[UrlContext], cse_domains: list[str]) 
         return
 
     ip_brand_counts = build_ip_brand_counts(candidates)
-    known_brand_favicon_hashes, known_phish_favicon_hashes, known_phish_dom_hashes = load_known_hashes()
+    known_brand_favicon_hashes, known_brand_logo_hashes, known_brand_dom_hashes = load_known_hashes()
     raw_rows = asyncio.run(
         run_pipeline_async(
             candidates,
             cse_domains,
             ip_brand_counts,
             known_brand_favicon_hashes,
-            known_phish_favicon_hashes,
-            known_phish_dom_hashes,
+            known_brand_logo_hashes,
+            known_brand_dom_hashes,
         )
     )
 

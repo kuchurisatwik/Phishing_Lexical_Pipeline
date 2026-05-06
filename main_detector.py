@@ -279,22 +279,30 @@ TOKEN_ENTRIES = _build_token_list()
 # Set of all primary tokens for quick lookup
 ALL_PRIMARY_TOKENS = set(BRAND_REGISTRY.keys())
 
-# Restricted tokens: only matched as *exact whole labels* or exact combined domain.
-# NO prefix/suffix, NO substring, NO typo matching for these.
-# Any token <= 4 chars is prone to appearing inside normal English words/domains.
-RESTRICTED_TOKENS = {
-    # 2-3 char tokens
-    "vi",      # 'video', 'village', 'virtual', '.vip' etc.
-    "eci",     # 'special', 'service', 'generic' etc.
+# EXACT-ONLY tokens: so short/ambiguous that they ONLY match as exact whole-labels
+# or combined-exact.  NO prefix/suffix matching at all.
+# These 2-3 char tokens appear inside far too many ordinary English words.
+EXACT_ONLY_TOKENS = {
+    "vi",      # 'view', 'vine', 'visa', 'vip', 'vital', 'virus' etc.
+    "eci",     # 'eclair', 'special', 'deci', 'fiatemmeci' etc.
     "bse",     # 'observe', 'pnbsecure' etc.
     "nic",     # 'clinic', 'electronic', 'communication' etc.
-    "sac",     # 'sack', 'sacrifice' etc.
-    "bob",     # common English name
+    "sac",     # 'saclay', 'sacrifice', 'empresasac' etc.
+    "bob",     # 'boba', 'bobcat', 'bobina', common English name
     "nha",     # 'enharia', 'manhattan' etc.
     "sbi",     # 'orbit' -> o[rbi]t, '.biz' -> [sbi]z after stripping
     "rbi",     # 'orbit', 'barbi', 'harbin' etc.
     "pnb",     # short
     "jio",     # 'region' etc.
+    "dst",     # very short
+    "npr",     # short, common abbrev
+    "orgi",    # short
+}
+
+# Restricted tokens: matched as exact whole labels, combined-exact, AND
+# tightly-controlled prefix/suffix (label length <= 2× alias length).
+# NO substring, NO typo matching.
+RESTRICTED_TOKENS = {
     # 4-5 char tokens
     "cams",    # 'scams', '.cam' TLD etc.
     "iirs",    # 'chairs', 'stairs' etc.
@@ -316,28 +324,39 @@ RESTRICTED_TOKENS = {
     "canara",  # 'canada' is Levenshtein 1 away
     "tdscpc",  # short
     "cloud",   # very common English word
-    "npr",     # short, common abbrev
     "census",  # common English word
-    "orgi",    # short
     "homeloans", # common English phrase
     "parivahan", # 'pariah', 'parvati' etc.
     "vahan",   # 'dahan', 'jahan', 'bahan', 'vatan' etc.
     "sarathi",  # common Hindi word
+    "myvi",    # common non-brand word
 }
 
 # For non-restricted tokens, minimum alias length for substring matching
-MIN_SUBSTR_LEN = 5
+MIN_SUBSTR_LEN = 6
+
+# Maximum label-to-alias length ratio for prefix/suffix matching on restricted tokens.
+# A label like "sbiq" (len 4) for alias "sbi" (len 3) has ratio 1.33 — OK.
+# A label like "bobablacksheep" (len 14) for alias "bob" (len 3) has ratio 4.67 — rejected.
+MAX_PREFIX_SUFFIX_RATIO = 2.0
 
 # Common English words that should never match as a brand token
 # (used for whole-label checks on short tokens)
 COMMON_WORDS = {
+    # Generic web / service words
     "service", "services", "secure", "security", "server",
     "observe", "reserved", "describe", "subscribe",
-    "nice", "nick", "nickel", "nicolas",
-    "bobby", "bobcat",
-    "basic", "obesity",
     "device", "devices", "devicex",
     "advice", "invoice",
+    "login", "logging", "session",
+    "notification", "authentication",
+    "verification", "userverify",
+    "retaillogin", "signin",
+    "token", "tokenx",
+    # Common English words with brand substrings
+    "nice", "nick", "nickel", "nicolas",
+    "bobby", "bobcat", "boba", "bobina", "bobble",
+    "basic", "obesity",
     "electronic", "electronics",
     "communication", "communications",
     "special", "specialist", "specific",
@@ -351,19 +370,33 @@ COMMON_WORDS = {
     "practice", "practical", "practicable",
     "sacrifice",
     "region", "regional",
-    "login", "logging", "session",
-    "notification", "authentication",
-    "verification", "userverify",
-    "retaillogin", "signin",
-    "token", "tokenx",
+    # Major brands / tech platforms
     "google", "facebook", "amazon", "microsoft",
     "instagram", "twitter", "youtube", "whatsapp",
+    # Words starting/containing 'vi' (vi = Vodafone Idea)
     "vibration", "visible", "visit", "visitor",
     "video", "view", "village", "violin",
     "visa", "vision", "vital", "vitamin",
     "vivid", "voice", "void", "volume",
     "victory", "victim", "vintage", "virtual",
     "vietnam", "viking", "vinyl",
+    "vine", "violet", "virus", "vichy", "viper",
+    "vigor", "vibe", "vibes", "vice", "viewer",
+    "viewsuite", "viewdocument", "viewdocuments",
+    "visapics", "visualpure", "visualdesigner",
+    "vividmesh", "vividmeshflow", "vitalpalette",
+    "vinecarg", "vitalpur", "vip",
+    # Words with 'eci'
+    "eclair", "deci", "decimal", "decision", "species",
+    "precise", "precious", "specimen", "recipe",
+    # Words with 'sac'
+    "saclay", "sack", "sacred", "sacramento",
+    # Words with 'bob'
+    "bobodoument", "bobodouments",
+    # Words with 'nic'
+    "scenic", "chronicle", "chronic", "unique",
+    "panic", "picnic", "sonic", "tonic", "ironic",
+    "organic", "mechanic", "volcanic", "botanical",
     # Common words that typo-match parivahan/vahan/sarathi
     "dahan", "jahan", "bahan", "vatan", "vahan",
     "rahan", "mahan", "sahan", "kahan",
@@ -381,10 +414,21 @@ def load_cse(folder):
     for file in os.listdir(folder):
         path = os.path.join(folder, file)
 
-        if file.endswith(".xlsx"):
-            df = pd.read_excel(path)
+        if file.endswith(".xlsx") and not file.startswith("~$"):
+            csv_path = path.replace(".xlsx", ".csv")
+            if not os.path.exists(csv_path):
+                log.info("Converting %s to %s before loading", file, os.path.basename(csv_path))
+                df = pd.read_excel(path)
+                df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+            try:
+                df = pd.read_csv(csv_path, encoding="utf-8-sig")
+            except UnicodeDecodeError:
+                df = pd.read_csv(csv_path, encoding="latin1")
         elif file.endswith(".csv"):
-            df = pd.read_csv(path)
+            try:
+                df = pd.read_csv(path, encoding="utf-8-sig")
+            except UnicodeDecodeError:
+                df = pd.read_csv(path, encoding="latin1")
         else:
             continue
 
@@ -476,14 +520,13 @@ def match_domain(labels, path, domain):
     Strategy:
     1. Normalize each label and the full combined domain
     2. Try exact whole-label matching first (highest confidence)
-    3. Try substring matching (longer aliases first to avoid FP)
-    4. Try typo detection via Levenshtein on individual labels
-    5. Try path matching (lowest confidence)
+    3. For exact-only tokens: only exact-label and combined-exact
+    4. For restricted tokens: exact + tightly-controlled prefix/suffix
+    5. For unrestricted tokens: substring + typo matching
     """
     # Precompute normalized values
     norm_labels = [normalize(l) for l in labels]
     norm_combined = normalize("".join(labels))
-    norm_path = normalize(path)
 
     best_match = None  # (token, score, reason, match_type, alias_len)
 
@@ -491,6 +534,7 @@ def match_domain(labels, path, domain):
         if not norm_alias:
             continue
 
+        is_exact_only = primary in EXACT_ONLY_TOKENS or norm_alias in EXACT_ONLY_TOKENS
         is_restricted = primary in RESTRICTED_TOKENS or norm_alias in RESTRICTED_TOKENS
 
         # ---- STRATEGY 1: Exact whole-label match ----
@@ -508,27 +552,39 @@ def match_domain(labels, path, domain):
             # but continue iterating to see if a LONGER alias matches
             continue
 
-        # ---- STRATEGY 2: Restricted token matching ----
-        # For restricted tokens: allow exact combined match AND
-        # prefix/suffix match on individual labels (catches netpnb, sbiq, etc.)
-        if is_restricted:
-            # 2a: Combined-exact (e.g. b-o-b -> bob)
+        # ---- STRATEGY 2: Exact-only token handling ----
+        # For very short / ambiguous tokens: ONLY exact-label and combined-exact
+        if is_exact_only:
             if norm_combined == norm_alias:
                 candidate = (primary, 0.96, "combined_exact", "lexical", alias_len)
                 if best_match is None or candidate[4] > best_match[4]:
                     best_match = candidate
-            # 2b: Prefix/suffix on individual labels
+            continue  # No prefix/suffix, no substring, no typo
+
+        # ---- STRATEGY 3: Restricted token matching ----
+        # Allow exact combined match AND tightly-controlled prefix/suffix
+        if is_restricted:
+            # 3a: Combined-exact (e.g. b-o-b -> bob)
+            if norm_combined == norm_alias:
+                candidate = (primary, 0.96, "combined_exact", "lexical", alias_len)
+                if best_match is None or candidate[4] > best_match[4]:
+                    best_match = candidate
+            # 3b: Prefix/suffix on individual labels — with tight length cap
             for nl in norm_labels:
                 if nl == norm_alias:
                     continue  # Already handled by Strategy 1
-                if len(nl) > alias_len and (nl.startswith(norm_alias) or nl.endswith(norm_alias)):
+                # Tight ratio check: label must be close in length to alias
+                # Catches "sbiq", "netpnb", "axisg" but NOT "bobablacksheep"
+                if (len(nl) > alias_len
+                    and len(nl) <= alias_len * MAX_PREFIX_SUFFIX_RATIO
+                    and (nl.startswith(norm_alias) or nl.endswith(norm_alias))):
                     if not _is_common_word(nl):
                         candidate = (primary, 0.93, "prefix_suffix", "lexical", alias_len)
                         if best_match is None or candidate[4] > best_match[4]:
                             best_match = candidate
             continue  # Skip general substring/typo for restricted tokens
 
-        # ---- STRATEGY 3: Substring match in combined domain ----
+        # ---- STRATEGY 4: Substring match in combined domain ----
         if alias_len >= MIN_SUBSTR_LEN and norm_alias in norm_combined:
             # Verify this isn't a common-word false positive
             if not _is_common_word(norm_alias):
@@ -536,7 +592,7 @@ def match_domain(labels, path, domain):
                 if best_match is None or candidate[4] > best_match[4]:
                     best_match = candidate
 
-        # ---- STRATEGY 4: Substring match in individual labels ----
+        # ---- STRATEGY 5: Substring match in individual labels ----
         if alias_len >= MIN_SUBSTR_LEN:
             for nl in norm_labels:
                 if norm_alias in nl and norm_alias != nl:
@@ -545,31 +601,19 @@ def match_domain(labels, path, domain):
                         if best_match is None or candidate[4] > best_match[4]:
                             best_match = candidate
 
-        # ---- STRATEGY 4: Typo detection (Levenshtein distance <= 1) ----
-        # Only for aliases of length >= 4 to avoid FP on very short tokens
+        # ---- STRATEGY 6: Typo detection (Levenshtein distance <= 1) ----
+        # Only for aliases of length >= 5 to avoid FP on short tokens
         # (short token typos like 5bi->sbi are already caught via leet normalization)
-        if alias_len >= 4:
+        if alias_len >= 5:
             for nl in norm_labels:
                 if abs(len(nl) - alias_len) <= 1:
                     dist = levenshtein(nl, norm_alias)
                     if dist == 1:
-                        # For short tokens (<=4 chars), require first char to match
-                        # to avoid FP like rbs->rbi, abs->obs, etc.
-                        if alias_len <= 4 and nl and norm_alias and nl[0] != norm_alias[0]:
-                            continue
                         # Make sure the label isn't a common word
                         if not _is_common_word(nl):
                             candidate = (primary, 0.85, "typo", "lexical", alias_len)
                             if best_match is None or candidate[4] > best_match[4]:
                                 best_match = candidate
-
-    # ---- STRATEGY 5: Path-based matching (non-lexical) ----
-    if best_match is None and norm_path:
-        for norm_alias, primary, alias_len in TOKEN_ENTRIES:
-            if alias_len >= 4 and norm_alias in norm_path:
-                if not _is_common_word(norm_alias):
-                    best_match = (primary, 0.80, "path", "non-lexical", alias_len)
-                    break
 
     if best_match:
         return best_match[0], best_match[1], best_match[2], best_match[3]
@@ -643,6 +687,7 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description="Phishing Lexical Detector")
     parser.add_argument("--input-data", help="Path to input data directory or file", default=None)
+    parser.add_argument("--lexical-only", action="store_true", help="Only run the lexical matching phase, skip feature extraction")
     args = parser.parse_args()
 
     from run_pipeline import run_extraction_pipeline, load_cse_records, load_cse_domains
@@ -675,7 +720,15 @@ def main():
     for path in target_paths:
         file = os.path.basename(path)
         if file.endswith(".xlsx") and not file.startswith("~$"):
-            df = pd.read_excel(path)
+            csv_path = path.replace(".xlsx", ".csv")
+            if not os.path.exists(csv_path):
+                log.info("Converting %s to %s before loading", file, os.path.basename(csv_path))
+                df = pd.read_excel(path)
+                df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+            try:
+                df = pd.read_csv(csv_path, encoding="utf-8-sig")
+            except UnicodeDecodeError:
+                df = pd.read_csv(csv_path, encoding="latin1")
         elif file.endswith(".csv"):
             try:
                 df = pd.read_csv(path, encoding="utf-8-sig")
@@ -704,8 +757,20 @@ def main():
 
     log.info("Loaded %d target URLs to classify", len(targets))
 
-    # Classify
-    results = [classify(u, cse_domains_set) for u in targets]
+    # Classify in parallel using process pool
+    import concurrent.futures
+    import multiprocessing
+    from tqdm import tqdm
+    
+    workers = min(32, multiprocessing.cpu_count() if multiprocessing.cpu_count() else 4)
+    log.info("Classifying %d URLs using %d CPU workers...", len(targets), workers)
+    
+    results = []
+    chunksize = max(1, len(targets) // (workers * 4))
+    with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(classify, u, cse_domains_set) for u in targets]
+        for future in tqdm(concurrent.futures.as_completed(futures), total=len(targets), desc="Lexical Match"):
+            results.append(future.result())
     df = pd.DataFrame(results)
 
     # Split: lexical matches vs everything else
@@ -718,40 +783,43 @@ def main():
     log.info("Lexical matches: %d  |  Non-lexical: %d", len(lexical), len(non_lexical))
     
     if len(lexical) > 0:
-        log.info("Running extraction pipeline on %d lexical matches...", len(lexical))
-        cse_records = load_cse_records()
-        cse_domains = load_cse_domains(cse_records)
-        token_map = get_token_mapping(cse_records)
-        
-        contexts = []
-        for _, row in lexical.iterrows():
-            token = row['cse']
-            cse_record = token_map.get(token)
+        if args.lexical_only:
+            log.info("Skipping feature extraction phase due to --lexical-only flag.")
+        else:
+            log.info("Running extraction pipeline on %d lexical matches...", len(lexical))
+            cse_records = load_cse_records()
+            cse_domains = load_cse_domains(cse_records)
+            token_map = get_token_mapping(cse_records)
             
-            # Use original URL to preserve http/https, else parse and construct
-            url = row['url']
-            domain, _, _ = parse(url)
-            
-            ctx = UrlContext(
-                url=url,
-                detected_domain=domain,
-                target_domain=cse_record.domain if cse_record else "",
-                cse_name=cse_record.name if cse_record else token,
-                source_label="Unlabeled",
-                source_file="main_detector_targets",
-            )
-            contexts.append(ctx)
-            
-        run_extraction_pipeline(contexts, cse_domains)
-
-        # Generate evidence screenshots + final xlsx report
-        try:
-            from extract import evidence_generator
-            report_path = evidence_generator.generate_report(output_dir=output_folder)
-            if report_path:
-                log.info("Final phishing report: %s", report_path)
-        except Exception as e:
-            log.error("Failed to generate evidence report: %s", e)
+            contexts = []
+            for _, row in lexical.iterrows():
+                token = row['cse']
+                cse_record = token_map.get(token)
+                
+                # Use original URL to preserve http/https, else parse and construct
+                url = row['url']
+                domain, _, _ = parse(url)
+                
+                ctx = UrlContext(
+                    url=url,
+                    detected_domain=domain,
+                    target_domain=cse_record.domain if cse_record else "",
+                    cse_name=cse_record.name if cse_record else token,
+                    source_label="Unlabeled",
+                    source_file="main_detector_targets",
+                )
+                contexts.append(ctx)
+                
+            run_extraction_pipeline(contexts, cse_domains)
+    
+            # Generate evidence screenshots + final xlsx report
+            try:
+                from extract import evidence_generator
+                report_path = evidence_generator.generate_report(output_dir=output_folder)
+                if report_path:
+                    log.info("Final phishing report: %s", report_path)
+            except Exception as e:
+                log.error("Failed to generate evidence report: %s", e)
 
 if __name__ == "__main__":
     main()
