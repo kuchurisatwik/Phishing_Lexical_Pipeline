@@ -337,12 +337,12 @@ RESTRICTED_TOKENS = {
 }
 
 # For non-restricted tokens, minimum alias length for substring matching
-MIN_SUBSTR_LEN = 6
+MIN_SUBSTR_LEN = 5
 
 # Maximum label-to-alias length ratio for prefix/suffix matching on restricted tokens.
 # A label like "sbiq" (len 4) for alias "sbi" (len 3) has ratio 1.33 — OK.
 # A label like "bobablacksheep" (len 14) for alias "bob" (len 3) has ratio 4.67 — rejected.
-MAX_PREFIX_SUFFIX_RATIO = 2.0
+MAX_PREFIX_SUFFIX_RATIO = 2.5
 
 # Common English words that should never match as a brand token
 # (used for whole-label checks on short tokens)
@@ -605,19 +605,20 @@ def match_domain(labels, path, domain):
                         if best_match is None or candidate[4] > best_match[4]:
                             best_match = candidate
 
-        # ---- STRATEGY 6: Typo detection (Levenshtein distance <= 1) ----
-        # Only for aliases of length >= 5 to avoid FP on short tokens
-        # (short token typos like 5bi->sbi are already caught via leet normalization)
-        if alias_len >= 5:
-            for nl in norm_labels:
-                if abs(len(nl) - alias_len) <= 1:
-                    dist = levenshtein(nl, norm_alias)
-                    if dist == 1:
-                        # Make sure the label isn't a common word
-                        if not _is_common_word(nl):
-                            candidate = (primary, 0.85, "typo", "lexical", alias_len)
-                            if best_match is None or candidate[4] > best_match[4]:
-                                best_match = candidate
+        # ---- STRATEGY 6: Typo detection ----
+        # DISABLED: Levenshtein-based typo matching produces too many false
+        # positives. Leet-speak normalization already catches common typosquats
+        # (e.g. 5bi -> sbi, h0fc -> hdfc) via the normalize() function.
+        # To re-enable, uncomment the block below.
+        # if alias_len >= 5:
+        #     for nl in norm_labels:
+        #         if abs(len(nl) - alias_len) <= 1:
+        #             dist = levenshtein(nl, norm_alias)
+        #             if dist == 1:
+        #                 if not _is_common_word(nl):
+        #                     candidate = (primary, 0.85, "typo", "lexical", alias_len)
+        #                     if best_match is None or candidate[4] > best_match[4]:
+        #                         best_match = candidate
 
     if best_match:
         return best_match[0], best_match[1], best_match[2], best_match[3]
