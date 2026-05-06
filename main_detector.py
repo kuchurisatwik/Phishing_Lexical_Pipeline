@@ -542,7 +542,7 @@ def match_domain(labels, path, domain):
         for nl in norm_labels:
             if nl == norm_alias:
                 # Perfect whole-label match
-                candidate = (primary, 0.98, "exact_label", "lexical", alias_len)
+                candidate = (primary, 0.85, "exact_label", "lexical", alias_len)
                 if best_match is None or candidate[4] > best_match[4]:
                     best_match = candidate
                 break
@@ -556,7 +556,7 @@ def match_domain(labels, path, domain):
         # For very short / ambiguous tokens: ONLY exact-label and combined-exact
         if is_exact_only:
             if norm_combined == norm_alias:
-                candidate = (primary, 0.96, "combined_exact", "lexical", alias_len)
+                candidate = (primary, 0.85, "combined_exact", "lexical", alias_len)
                 if best_match is None or candidate[4] > best_match[4]:
                     best_match = candidate
             continue  # No prefix/suffix, no substring, no typo
@@ -566,7 +566,7 @@ def match_domain(labels, path, domain):
         if is_restricted:
             # 3a: Combined-exact (e.g. b-o-b -> bob)
             if norm_combined == norm_alias:
-                candidate = (primary, 0.96, "combined_exact", "lexical", alias_len)
+                candidate = (primary, 0.85, "combined_exact", "lexical", alias_len)
                 if best_match is None or candidate[4] > best_match[4]:
                     best_match = candidate
             # 3b: Prefix/suffix on individual labels — with tight length cap
@@ -579,7 +579,7 @@ def match_domain(labels, path, domain):
                     and len(nl) <= alias_len * MAX_PREFIX_SUFFIX_RATIO
                     and (nl.startswith(norm_alias) or nl.endswith(norm_alias))):
                     if not _is_common_word(nl):
-                        candidate = (primary, 0.93, "prefix_suffix", "lexical", alias_len)
+                        candidate = (primary, 0.85, "prefix_suffix", "lexical", alias_len)
                         if best_match is None or candidate[4] > best_match[4]:
                             best_match = candidate
             continue  # Skip general substring/typo for restricted tokens
@@ -588,7 +588,7 @@ def match_domain(labels, path, domain):
         if alias_len >= MIN_SUBSTR_LEN and norm_alias in norm_combined:
             # Verify this isn't a common-word false positive
             if not _is_common_word(norm_alias):
-                candidate = (primary, 0.95, "combined", "lexical", alias_len)
+                candidate = (primary, 0.85, "combined", "lexical", alias_len)
                 if best_match is None or candidate[4] > best_match[4]:
                     best_match = candidate
 
@@ -597,7 +597,7 @@ def match_domain(labels, path, domain):
             for nl in norm_labels:
                 if norm_alias in nl and norm_alias != nl:
                     if not _is_common_word(nl):
-                        candidate = (primary, 0.92, "label_substr", "lexical", alias_len)
+                        candidate = (primary, 0.85, "label_substr", "lexical", alias_len)
                         if best_match is None or candidate[4] > best_match[4]:
                             best_match = candidate
 
