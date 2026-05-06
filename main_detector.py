@@ -337,12 +337,12 @@ RESTRICTED_TOKENS = {
 }
 
 # For non-restricted tokens, minimum alias length for substring matching
-MIN_SUBSTR_LEN = 5
+MIN_SUBSTR_LEN = 6
 
 # Maximum label-to-alias length ratio for prefix/suffix matching on restricted tokens.
 # A label like "sbiq" (len 4) for alias "sbi" (len 3) has ratio 1.33 — OK.
 # A label like "bobablacksheep" (len 14) for alias "bob" (len 3) has ratio 4.67 — rejected.
-MAX_PREFIX_SUFFIX_RATIO = 2.5
+MAX_PREFIX_SUFFIX_RATIO = 2.0
 
 # Common English words that should never match as a brand token
 # (used for whole-label checks on short tokens)
@@ -546,7 +546,7 @@ def match_domain(labels, path, domain):
         for nl in norm_labels:
             if nl == norm_alias:
                 # Perfect whole-label match
-                candidate = (primary, 0.98, "exact_label", "lexical", alias_len)
+                candidate = (primary, 0.85, "exact_label", "lexical", alias_len)
                 if best_match is None or candidate[4] > best_match[4]:
                     best_match = candidate
                 break
@@ -560,7 +560,7 @@ def match_domain(labels, path, domain):
         # For very short / ambiguous tokens: ONLY exact-label and combined-exact
         if is_exact_only:
             if norm_combined == norm_alias:
-                candidate = (primary, 0.96, "combined_exact", "lexical", alias_len)
+                candidate = (primary, 0.85, "combined_exact", "lexical", alias_len)
                 if best_match is None or candidate[4] > best_match[4]:
                     best_match = candidate
             continue  # No prefix/suffix, no substring, no typo
@@ -570,7 +570,7 @@ def match_domain(labels, path, domain):
         if is_restricted:
             # 3a: Combined-exact (e.g. b-o-b -> bob)
             if norm_combined == norm_alias:
-                candidate = (primary, 0.96, "combined_exact", "lexical", alias_len)
+                candidate = (primary, 0.85, "combined_exact", "lexical", alias_len)
                 if best_match is None or candidate[4] > best_match[4]:
                     best_match = candidate
             # 3b: Prefix/suffix on individual labels — with tight length cap
@@ -583,7 +583,7 @@ def match_domain(labels, path, domain):
                     and len(nl) <= alias_len * MAX_PREFIX_SUFFIX_RATIO
                     and (nl.startswith(norm_alias) or nl.endswith(norm_alias))):
                     if not _is_common_word(nl):
-                        candidate = (primary, 0.93, "prefix_suffix", "lexical", alias_len)
+                        candidate = (primary, 0.85, "prefix_suffix", "lexical", alias_len)
                         if best_match is None or candidate[4] > best_match[4]:
                             best_match = candidate
             continue  # Skip general substring/typo for restricted tokens
@@ -592,7 +592,7 @@ def match_domain(labels, path, domain):
         if alias_len >= MIN_SUBSTR_LEN and norm_alias in norm_combined:
             # Verify this isn't a common-word false positive
             if not _is_common_word(norm_alias):
-                candidate = (primary, 0.95, "combined", "lexical", alias_len)
+                candidate = (primary, 0.85, "combined", "lexical", alias_len)
                 if best_match is None or candidate[4] > best_match[4]:
                     best_match = candidate
 
@@ -601,24 +601,23 @@ def match_domain(labels, path, domain):
             for nl in norm_labels:
                 if norm_alias in nl and norm_alias != nl:
                     if not _is_common_word(nl):
-                        candidate = (primary, 0.92, "label_substr", "lexical", alias_len)
+                        candidate = (primary, 0.85, "label_substr", "lexical", alias_len)
                         if best_match is None or candidate[4] > best_match[4]:
                             best_match = candidate
 
-        # ---- STRATEGY 6: Typo detection ----
-        # DISABLED: Levenshtein-based typo matching produces too many false
-        # positives. Leet-speak normalization already catches common typosquats
-        # (e.g. 5bi -> sbi, h0fc -> hdfc) via the normalize() function.
-        # To re-enable, uncomment the block below.
-        # if alias_len >= 5:
-        #     for nl in norm_labels:
-        #         if abs(len(nl) - alias_len) <= 1:
-        #             dist = levenshtein(nl, norm_alias)
-        #             if dist == 1:
-        #                 if not _is_common_word(nl):
-        #                     candidate = (primary, 0.85, "typo", "lexical", alias_len)
-        #                     if best_match is None or candidate[4] > best_match[4]:
-        #                         best_match = candidate
+        # ---- STRATEGY 6: Typo detection (Levenshtein distance <= 1) ----
+        # Only for aliases of length >= 5 to avoid FP on short tokens
+        # (short token typos like 5bi->sbi are already caught via leet normalization)
+        if alias_len >= 5:
+            for nl in norm_labels:
+                if abs(len(nl) - alias_len) <= 1:
+                    dist = levenshtein(nl, norm_alias)
+                    if dist == 1:
+                        # Make sure the label isn't a common word
+                        if not _is_common_word(nl):
+                            candidate = (primary, 0.85, "typo", "lexical", alias_len)
+                            if best_match is None or candidate[4] > best_match[4]:
+                                best_match = candidate
 
     if best_match:
         return best_match[0], best_match[1], best_match[2], best_match[3]
