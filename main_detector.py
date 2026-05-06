@@ -279,6 +279,10 @@ TOKEN_ENTRIES = _build_token_list()
 # Set of all primary tokens for quick lookup
 ALL_PRIMARY_TOKENS = set(BRAND_REGISTRY.keys())
 
+# Lexical Match Threshold: URLs with a match score below this will be 
+# moved to 'non-lexical' even if a keyword was found.
+LEXICAL_THRESHOLD = 0.80
+
 # EXACT-ONLY tokens: so short/ambiguous that they ONLY match as exact whole-labels
 # or combined-exact.  NO prefix/suffix matching at all.
 # These 2-3 char tokens appear inside far too many ordinary English words.
@@ -638,16 +642,27 @@ def classify(url, whitelist):
         }
 
     result = match_domain(labels, path, domain)
-
     if result:
         token, score, reason, mtype = result
-        return {
-            "url": url,
-            "cse": token,
-            "score": score,
-            "reason": reason,
-            "match_type": mtype,
-        }
+        
+        # Check against threshold
+        if score >= LEXICAL_THRESHOLD:
+            return {
+                "url": url,
+                "cse": token,
+                "score": score,
+                "reason": reason,
+                "match_type": "lexical",
+            }
+        else:
+            # Match found but too weak/noisy
+            return {
+                "url": url,
+                "cse": token,
+                "score": score,
+                "reason": f"below_threshold_{reason}",
+                "match_type": "non-lexical",
+            }
 
     return {
         "url": url,
