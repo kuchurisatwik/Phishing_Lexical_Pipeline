@@ -281,7 +281,7 @@ ALL_PRIMARY_TOKENS = set(BRAND_REGISTRY.keys())
 
 # Lexical Match Threshold: URLs with a match score below this will be 
 # moved to 'non-lexical' even if a keyword was found.
-LEXICAL_THRESHOLD = 0.80
+LEXICAL_THRESHOLD = 0.85
 
 # EXACT-ONLY tokens: so short/ambiguous that they ONLY match as exact whole-labels
 # or combined-exact.  NO prefix/suffix matching at all.
