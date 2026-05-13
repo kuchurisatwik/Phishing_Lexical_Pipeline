@@ -376,7 +376,7 @@ def _row_to_context(row: pd.Series, source_file: str, source_row: int) -> UrlCon
         "Identified Phishing/Suspected Domain Name",
         "Identified Phishing Domain Name",
         "Identified Suspected Domain Name",
-        "Domain Name",
+        "domain_name",
         "domain",
         "url",
     )
