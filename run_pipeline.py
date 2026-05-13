@@ -47,26 +47,45 @@ from extract.feature_extractor import (
     registered_domain,
 )
 from extract.rdap_whois import RDAPClient
-
-def simple_dns_check(domain: str) -> DnsResult:
+import aiodns
+async def async_dns_check(domain: str, resolver: aiodns.DNSResolver) -> tuple[DnsResult, list[str]]:
+    ips = []
+    nameservers = []
+    dns_error = ""
+    cname_exists = 0
+    cname_chain_length = 0
+    
     try:
-        ip = socket.gethostbyname(domain)
-        return DnsResult(
-            dns_check_pass=1,
-            dns_resolves_to_ip=1,
-            resolved_ips=ip,
-            cname_exists=0,
-            cname_chain_length=0,
-            dns_error="",
-            status="success"
-        )
-    except Exception as exc:
-        return DnsResult(
-            dns_check_pass=0,
-            dns_resolves_to_ip=0,
-            dns_error=type(exc).__name__,
-            status="error"
-        )
+        result = await resolver.query(domain, 'A')
+        ips = [res.host for res in result]
+    except Exception as e:
+        dns_error += type(e).__name__
+
+    try:
+        ns_result = await resolver.query(domain, 'NS')
+        nameservers = [res.host for res in ns_result]
+    except Exception:
+        pass
+        
+    if not ips:
+        try:
+            await resolver.query(domain, 'CNAME')
+            cname_exists = 1
+            cname_chain_length = 1
+        except Exception:
+            pass
+
+    has_dns = bool(ips or cname_exists)
+    dns_result = DnsResult(
+        dns_check_pass=int(has_dns),
+        dns_resolves_to_ip=int(bool(ips)),
+        resolved_ips=";".join(sorted(ips)),
+        cname_exists=cname_exists,
+        cname_chain_length=cname_chain_length,
+        dns_error=dns_error,
+        status="success" if has_dns else "not_found"
+    )
+    return dns_result, nameservers
 
 # Only configure logging if no handlers are already set (i.e. not launched from main_detector.py)
 if not logging.root.handlers:
@@ -618,26 +637,32 @@ def prefilter_dns_active_contexts(contexts: list[UrlContext]) -> tuple[list[UrlC
         DNS_RETRIES,
     )
 
-    def check(context: UrlContext) -> DnsResult:
-        return simple_dns_check(context.detected_domain)
+    async def _run_all(ctxs: list[UrlContext]):
+        resolver = aiodns.DNSResolver(timeout=DNS_TIMEOUT, tries=DNS_RETRIES)
+        sem = asyncio.Semaphore(workers)
+        
+        async def _check(index, context):
+            async with sem:
+                dns_res, ns_list = await async_dns_check(context.detected_domain, resolver)
+                if ns_list:
+                    context.nameservers = ";".join(sorted(ns_list))
+                return index, context, dns_res
 
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        future_to_item = {
-            executor.submit(check, context): (index, context)
-            for index, context in enumerate(contexts)
-        }
-        with tqdm(total=len(contexts), desc="DNS precheck", unit="url") as pbar:
-            for future in as_completed(future_to_item):
-                index, context = future_to_item[future]
-                try:
-                    dns_result = future.result()
-                except Exception as exc:
-                    dns_result = DnsResult(
-                        dns_error=type(exc).__name__,
-                        status="error",
-                    )
-                results.append((index, context, dns_result))
-                pbar.update(1)
+        tasks = [_check(i, ctx) for i, ctx in enumerate(ctxs)]
+        res = []
+        for f in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="DNS precheck", unit="url"):
+            res.append(await f)
+        return res
+
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            # If we are already in an event loop (we shouldn't be here), run it manually
+            import nest_asyncio
+            nest_asyncio.apply()
+        results = asyncio.run(_run_all(contexts))
+    except RuntimeError:
+        results = asyncio.run(_run_all(contexts))
 
     active_contexts: list[UrlContext] = []
     dns_failed_rows: list[dict] = []
@@ -1155,10 +1180,14 @@ class AsyncFeatureCache:
     async def _dns(self, context: UrlContext) -> DnsResult:
         try:
             async with self.dns_sem:
-                return await asyncio.to_thread(
-                    simple_dns_check,
-                    context.detected_domain
-                )
+                resolver = getattr(self, "_aiodns_resolver", None)
+                if not resolver:
+                    self._aiodns_resolver = aiodns.DNSResolver(timeout=DNS_TIMEOUT, tries=DNS_RETRIES)
+                    resolver = self._aiodns_resolver
+                dns_res, ns_list = await async_dns_check(context.detected_domain, resolver)
+                if ns_list:
+                    context.nameservers = ";".join(sorted(ns_list))
+                return dns_res
         except Exception as exc:
             return DnsResult(dns_error=type(exc).__name__, status="error")
 

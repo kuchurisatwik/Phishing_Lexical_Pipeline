@@ -243,24 +243,17 @@ class RDAPClient:
         self,
         session: aiohttp.ClientSession,
         rdap_concurrency: int = 50,
-        whois_concurrency: int = 10,
+        whois_concurrency: int = 10,  # Keeping signature for compatibility but ignored
         rdap_timeout: float = 10.0,
-        whois_timeout: float = 15.0,
-        whois_delay: float = 0.5,
+        whois_timeout: float = 15.0,  # Keeping signature for compatibility but ignored
+        whois_delay: float = 0.5,     # Keeping signature for compatibility but ignored
         rdap_retries: int = 2,
     ):
         self._session = session
         self._bootstrap: dict[str, str] = {}
         self._rdap_sem = asyncio.Semaphore(rdap_concurrency)
-        self._whois_sem = asyncio.Semaphore(whois_concurrency)
         self._rdap_timeout = rdap_timeout
-        self._whois_timeout = whois_timeout
-        self._whois_delay = whois_delay
         self._rdap_retries = rdap_retries
-        self._whois_executor = ThreadPoolExecutor(
-            max_workers=whois_concurrency,
-            thread_name_prefix="whois",
-        )
         self._cache: dict[str, DomainInfo] = {}
         self._inflight: dict[str, asyncio.Task[DomainInfo]] = {}
         self._initialized = False
@@ -273,11 +266,8 @@ class RDAPClient:
         self._initialized = True
 
     def shutdown(self) -> None:
-        """Clean up the WHOIS thread pool."""
-        try:
-            self._whois_executor.shutdown(wait=False)
-        except Exception:
-            pass
+        """Clean up resources (No-op now that WHOIS thread pool is removed)."""
+        pass
 
     # -----------------------------------------------------------------
     # Public lookup
@@ -308,22 +298,15 @@ class RDAPClient:
         return info
 
     async def _lookup_uncached(self, domain: str) -> DomainInfo:
-        """RDAP lookup with WHOIS fallback for a normalized, uncached domain."""
+        """RDAP lookup (WHOIS fallback removed for extreme scale)."""
 
         info = await self._rdap_lookup(domain)
 
-        if info is None or (info.creation_date is None and info.expiration_date is None):
-            whois_info = await self._whois_fallback(domain)
-            if whois_info is not None:
-                if info is not None:
-                    whois_info.rdap_status = info.rdap_status
-                info = whois_info
-
         if info is None:
             info = DomainInfo(
-                error="Both RDAP and WHOIS failed",
+                error="RDAP failed (WHOIS fallback disabled)",
                 rdap_status="error",
-                whois_status="error",
+                whois_status="skipped",
             )
         return info
 
@@ -400,93 +383,4 @@ class RDAPClient:
                 await asyncio.sleep(0.5 * (2 ** attempt))
 
         log.debug("%s for %s", last_error, domain)
-        return DomainInfo(error=last_error or "RDAP error", rdap_status="error", whois_status="pending")
 
-    # -----------------------------------------------------------------
-    # WHOIS fallback — throttled to prevent IP blocking
-    # -----------------------------------------------------------------
-
-    async def _whois_fallback(self, domain: str) -> DomainInfo | None:
-        """Fallback to python-whois, throttled via semaphore."""
-        loop = asyncio.get_running_loop()
-
-        try:
-            async with self._whois_sem:
-                await asyncio.sleep(self._whois_delay)
-
-                info = await asyncio.wait_for(
-                    loop.run_in_executor(
-                        self._whois_executor,
-                        _sync_whois_lookup,
-                        domain,
-                        self._whois_timeout,
-                    ),
-                    timeout=self._whois_timeout + 5,
-                )
-                return info
-
-        except asyncio.TimeoutError:
-            log.debug("WHOIS timeout for %s", domain)
-            return DomainInfo(error="WHOIS timeout", source="whois", rdap_status="fallback", whois_status="timeout")
-        except Exception as exc:
-            log.debug("WHOIS fallback error for %s: %s", domain, exc)
-            return DomainInfo(error=str(exc), source="whois", rdap_status="fallback", whois_status="error")
-
-
-# ---------------------------------------------------------------------------
-# Sync WHOIS lookup (runs inside thread pool)
-# ---------------------------------------------------------------------------
-
-def _sync_whois_lookup(domain: str, timeout: float = 15.0) -> DomainInfo | None:
-    """Blocking WHOIS lookup with timeout.
-
-    Runs inside a thread executor; the caller manages concurrency.
-    """
-    try:
-        import whois
-
-        # Set socket timeout for the WHOIS query
-        old_timeout = socket.getdefaulttimeout()
-        socket.setdefaulttimeout(timeout)
-
-        try:
-            w = whois.whois(domain)
-        finally:
-            socket.setdefaulttimeout(old_timeout)
-
-        if w is None:
-            return None
-
-        creation = w.creation_date
-        expiration = w.expiration_date
-        registrant = str(w.registrant_name) if w.registrant_name else ""
-        registrar = str(w.registrar) if getattr(w, "registrar", None) else ""
-        nameservers = getattr(w, "name_servers", None) or getattr(w, "nameservers", None) or ()
-
-        if isinstance(creation, list):
-            creation = creation[0]
-        if isinstance(expiration, list):
-            expiration = expiration[0]
-        if isinstance(nameservers, str):
-            nameservers = [nameservers]
-
-        return DomainInfo(
-            creation_date=creation,
-            expiration_date=expiration,
-            registrant_name=registrant,
-            registrar_name=registrar,
-            nameservers=tuple(sorted(str(name).strip(".").lower() for name in nameservers if name)),
-            source="whois",
-            rdap_status="fallback",
-            whois_status="success",
-        )
-
-    except socket.timeout:
-        log.debug("WHOIS socket timeout for %s", domain)
-        return DomainInfo(error="socket timeout", source="whois", rdap_status="fallback", whois_status="timeout")
-    except ConnectionResetError:
-        log.debug("WHOIS connection reset for %s", domain)
-        return DomainInfo(error="connection reset", source="whois", rdap_status="fallback", whois_status="error")
-    except Exception as exc:
-        log.debug("WHOIS error for %s: %s", domain, type(exc).__name__)
-        return DomainInfo(error=str(exc), source="whois", rdap_status="fallback", whois_status="error")
