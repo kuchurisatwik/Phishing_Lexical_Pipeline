@@ -69,9 +69,15 @@ SECTOR_MAP = {
     "nha": "Government",
     "civil registration system": "Government",
     "rgcci": "Government",
+    "crs": "Government",
+    "crsorgi": "Government",
+    "ana crs": "Government",
     "census": "Government",
     "parivahan": "Government",
     "parivahan sewa": "Government",
+    # Healthcare
+    "aiims": "Healthcare",
+    "all india institute of medical sciences": "Healthcare",
     # Space & Research
     "isro": "Space & Research",
     "indian space research organisation": "Space & Research",
@@ -144,6 +150,107 @@ def _na(value) -> str:
     if text.lower() in {"", "nan", "nat", "none", "null", "-1"}:
         return "NA"
     return text
+
+
+def _load_cse_helpers() -> dict:
+    """Load reusable CSE lookup helpers for final report backfills."""
+    helpers = {
+        "by_domain": {},
+        "domains": [],
+        "token_map": {},
+        "parse": None,
+        "match_domain": None,
+    }
+
+    try:
+        from run_pipeline import load_cse_records, normalize_hostname
+
+        records = load_cse_records()
+        for record in records:
+            domain = normalize_hostname(record.domain)
+            if domain and record.name:
+                helpers["by_domain"][domain] = record.name
+        helpers["domains"] = sorted(helpers["by_domain"], key=len, reverse=True)
+
+        try:
+            from main_detector import get_token_mapping, parse, match_domain
+
+            helpers["token_map"] = get_token_mapping(records)
+            helpers["parse"] = parse
+            helpers["match_domain"] = match_domain
+        except Exception as exc:
+            log.debug("Lexical CSE backfill helpers unavailable: %s", exc)
+    except Exception as exc:
+        log.warning("CSE lookup helpers unavailable; report CSE columns may contain NA: %s", exc)
+
+    return helpers
+
+
+def _normalize_report_domain(value: str) -> str:
+    """Normalize a report domain/url without requiring pipeline imports."""
+    text = _na(value)
+    if text == "NA":
+        return ""
+    try:
+        from run_pipeline import normalize_hostname
+
+        return normalize_hostname(text)
+    except Exception:
+        text = re.sub(r"^https?://", "", text.strip().lower())
+        return text.split("/", 1)[0].lstrip("www.")
+
+
+def _lookup_cse_by_domain(value: str, helpers: dict) -> str:
+    domain = _normalize_report_domain(value)
+    if not domain:
+        return "NA"
+
+    by_domain = helpers.get("by_domain", {})
+    if domain in by_domain:
+        return by_domain[domain]
+
+    for known_domain in helpers.get("domains", []):
+        if domain == known_domain or domain.endswith(f".{known_domain}"):
+            return by_domain[known_domain]
+
+    return "NA"
+
+
+def _infer_cse_from_url(url: str, helpers: dict) -> str:
+    parse = helpers.get("parse")
+    match_domain = helpers.get("match_domain")
+    token_map = helpers.get("token_map", {})
+    if not parse or not match_domain or not token_map:
+        return "NA"
+
+    try:
+        domain, labels, path = parse(url)
+        result = match_domain(labels, path, domain)
+    except Exception as exc:
+        log.debug("Lexical CSE inference failed for %s: %s", url, exc)
+        return "NA"
+
+    if not result:
+        return "NA"
+
+    record = token_map.get(result[0])
+    if record and record.name:
+        return record.name
+    return "NA"
+
+
+def _report_cse_name(row: pd.Series, helpers: dict) -> str:
+    """Return the best CSE name available for a report row."""
+    existing = _na(row.get("critical_sector_entity_name"))
+    if existing != "NA":
+        return existing
+
+    for column in ("target_brand_domain", "matched_brand_domain"):
+        cse_name = _lookup_cse_by_domain(row.get(column), helpers)
+        if cse_name != "NA":
+            return cse_name
+
+    return _infer_cse_from_url(str(row.get("url", "")), helpers)
 
 
 def take_screenshots(url_data: list[tuple[str, str]], evidence_dir: str) -> dict[str, str]:
@@ -247,6 +354,12 @@ def generate_report(
         log.warning("Classification results CSV is empty.")
         return None
 
+    cse_helpers = _load_cse_helpers()
+    df["__report_cse_name"] = df.apply(
+        lambda row: _report_cse_name(row, cse_helpers),
+        axis=1,
+    )
+
     # Filter to only confirmed_phishing for screenshots
     confirmed = df[df["final_classification"] == "confirmed_phishing"].copy()
     log.info(
@@ -258,7 +371,7 @@ def generate_report(
     evidence_dir = os.path.join(output_dir, "Evidence")
     screenshot_map: dict[str, str] = {}
     if not confirmed.empty:
-        cse_series = confirmed.get("critical_sector_entity_name")
+        cse_series = confirmed.get("__report_cse_name")
         if cse_series is None:
             cse_series = pd.Series(["Unknown"] * len(confirmed), index=confirmed.index)
             
@@ -276,6 +389,7 @@ def generate_report(
     for _, row in df.iterrows():
         url = str(row.get("url", ""))
         final_class = str(row.get("final_classification", ""))
+        cse_name = _report_cse_name(row, cse_helpers)
 
         # Evidence path: only for confirmed phishing
         evidence_path = screenshot_map.get(url, "NA")
@@ -292,7 +406,7 @@ def generate_report(
 
         rows.append({
             "Identified Domain Name": url,
-            "Corresponding CSE Name": _na(row.get("critical_sector_entity_name")),
+            "Corresponding CSE Name": cse_name,
             "IP Address": _na(row.get("resolved_ips")),
             "Hosting ISP": _na(row.get("hosting_isp")),
             "Hosting Country": _na(row.get("hosting_country")),
@@ -300,9 +414,7 @@ def generate_report(
             "Registrant Country": _na(row.get("registrant_country")),
             "Name Servers": _na(row.get("nameservers")),
             "Evidence File Path": evidence_path,
-            "Source of Detection": _detect_sector(
-                str(row.get("critical_sector_entity_name", ""))
-            ),
+            "Source of Detection": _detect_sector(cse_name),
             "Remarks": remarks,
             "Phishing (Yes)": _phishing_label(final_class),
         })
@@ -314,7 +426,7 @@ def generate_report(
         dns_df = pd.read_csv(dns_failed_csv)
         for _, row in dns_df.iterrows():
             url = str(row.get("url", ""))
-            cse_name = _na(row.get("critical_sector_entity_name"))
+            cse_name = _report_cse_name(row, cse_helpers)
             rows.append({
                 "Identified Domain Name": url,
                 "Corresponding CSE Name": cse_name,
@@ -348,13 +460,18 @@ def generate_report(
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         # Add xlsx file
         zf.write(xlsx_path, arcname=xlsx_filename)
-        # Add Evidence folder
-        if os.path.exists(evidence_dir):
-            for root, _, files in os.walk(evidence_dir):
-                for file in files:
-                    file_path = os.path.join(root, file)
-                    rel_path = os.path.relpath(file_path, output_dir)
-                    zf.write(file_path, arcname=rel_path)
+        # Add only evidence files referenced by this report.
+        evidence_paths = {
+            path
+            for path in report_df["Evidence File Path"].astype(str)
+            if _na(path) != "NA"
+        }
+        for rel_path in sorted(evidence_paths):
+            file_path = os.path.join(output_dir, rel_path)
+            if os.path.exists(file_path):
+                zf.write(file_path, arcname=rel_path)
+            else:
+                log.warning("Referenced evidence file missing, not added to zip: %s", rel_path)
                     
     log.info("Zip archive created successfully: %s", zip_path)
 

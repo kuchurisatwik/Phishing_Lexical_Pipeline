@@ -88,6 +88,12 @@ python main_detector.py
 # With a custom input file or directory
 python main_detector.py --input-data path/to/urls.xlsx
 python main_detector.py --input-data path/to/input_folder/
+
+# Start from feature extraction using existing output/lexical.csv
+python main_detector.py --start-at feature-extraction
+
+# Start from feature extraction with a custom lexical matches CSV
+python main_detector.py --start-at feature-extraction --lexical-input path/to/lexical.csv
 ```
 
 ### Running Individual Components

@@ -243,7 +243,7 @@ class RDAPClient:
         self,
         session: aiohttp.ClientSession,
         rdap_concurrency: int = 50,
-        whois_concurrency: int = 2,
+        whois_concurrency: int = 10,
         rdap_timeout: float = 10.0,
         whois_timeout: float = 15.0,
         whois_delay: float = 0.5,

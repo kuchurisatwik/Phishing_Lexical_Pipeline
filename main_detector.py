@@ -69,7 +69,7 @@ LEET_MAP = {
     "ԁ": "d",
     "е": "e", "ҽ": "e",
     "һ": "h",
-    "і": "i", "ӏ": "i", "ı": "i", "l": "i",
+    "і": "i", "ӏ": "i", "ı": "i",
     "ј": "j",
     "ο": "o", "о": "o",
     "р": "p",
@@ -301,6 +301,10 @@ EXACT_ONLY_TOKENS = {
     "dst",     # very short
     "npr",     # short, common abbrev
     "orgi",    # short
+    "axis",
+    "cams",
+    "uidai",
+    "iocl",
 }
 
 # Restricted tokens: matched as exact whole labels, combined-exact, AND
@@ -308,13 +312,10 @@ EXACT_ONLY_TOKENS = {
 # NO substring, NO typo matching.
 RESTRICTED_TOKENS = {
     # 4-5 char tokens
-    "cams",    # 'scams', '.cam' TLD etc.
     "iirs",    # 'chairs', 'stairs' etc.
     "abha",    # 'abhay' etc.
     "abdm",    # very short
-    "axis",    # 'praxis', 'taxiservice' etc.
     "idfc",    # short
-    "iocl",    # 'bioclaw' etc.
     "isro",    # 'iso-manager' etc.
     "vssc",    # short
     "nrsc",    # short
@@ -323,7 +324,6 @@ RESTRICTED_TOKENS = {
     "kfin",    # short alias for kfintech
     "rebit",   # 'orbit', 'revit' etc.
     "aiims",   # 'aims' typo matches too many
-    "uidai",   # 'usdai' etc.
     "icici",   # distinctive but typo matches 'icivi'
     "canara",  # 'canada' is Levenshtein 1 away
     "tdscpc",  # short
@@ -334,6 +334,7 @@ RESTRICTED_TOKENS = {
     "vahan",   # 'dahan', 'jahan', 'bahan', 'vatan' etc.
     "sarathi",  # common Hindi word
     "myvi",    # common non-brand word
+    "rgcci",
 }
 
 # For non-restricted tokens, minimum alias length for substring matching
@@ -405,6 +406,7 @@ COMMON_WORDS = {
     "dahan", "jahan", "bahan", "vatan", "vahan",
     "rahan", "mahan", "sahan", "kahan",
     "pavan", "pravan", "sarath", "marathi",
+    "liquid", "praxis", "taxis", "maxis", "araxis", "webcam", "dashcam",
 }
 
 
@@ -438,10 +440,11 @@ def load_cse(folder):
 
         df.columns = df.columns.str.strip().str.lower()
 
-        for col in ["public url", "legitimate domains"]:
+        for col in ["domains", "domain", "url", "public url", "legitimate domains", "legitimate domain", "cse domain"]:
             if col in df.columns:
                 data = df[col].dropna().astype(str)
-                domains.extend(data.tolist())
+                for value in data:
+                    domains.extend(re.split(r"[\s,;|]+", value))
 
     # Normalize whitelist domains
     cleaned = set()
@@ -673,6 +676,11 @@ def classify(url, whitelist):
     }
 
 
+def classify_chunk(urls_chunk, whitelist):
+    """Classify a chunk of URLs (for efficient multiprocessing)."""
+    return [classify(u, whitelist) for u in urls_chunk]
+
+
 # ----------------------------
 def get_token_mapping(records):
     mapping = {}
@@ -698,15 +706,137 @@ def get_token_mapping(records):
         mapping[token] = found
     return mapping
 
+def load_lexical_matches(path):
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Lexical matches file not found: {path}")
+
+    try:
+        df = pd.read_csv(path, encoding="utf-8-sig")
+    except UnicodeDecodeError:
+        df = pd.read_csv(path, encoding="latin1")
+
+    df.columns = df.columns.str.strip().str.lower()
+
+    url_aliases = (
+        "url",
+        "urls",
+        "domain",
+        "domains",
+        "domain_name",
+        "domain name",
+        "identified phishing/suspected domain name",
+        "identified phishing domain name",
+        "identified suspected domain name",
+    )
+    cse_aliases = (
+        "cse",
+        "critical sector entity name",
+        "cooresponding cse",
+        "corresponding cse",
+        "application name",
+    )
+
+    url_column = next((column for column in url_aliases if column in df.columns), None)
+    if url_column is None:
+        raise ValueError("Lexical matches file is missing required column(s): url")
+    if url_column != "url":
+        df = df.rename(columns={url_column: "url"})
+
+    cse_column = next((column for column in cse_aliases if column in df.columns), None)
+    if cse_column is None:
+        log.warning(
+            "Lexical matches file has no CSE column; continuing with blank CSE values. "
+            "Feature extraction will have weaker brand context."
+        )
+        df["cse"] = ""
+    elif cse_column != "cse":
+        df = df.rename(columns={cse_column: "cse"})
+
+    if "match_type" in df.columns:
+        df = df[df["match_type"].fillna("").astype(str).str.lower() == "lexical"]
+
+    return df
+
+def run_feature_extraction_for_lexical(lexical, lexical_source="main_detector_targets"):
+    from run_pipeline import run_extraction_pipeline, load_cse_records, load_cse_domains
+    from extract.feature_extractor import UrlContext
+
+    if len(lexical) == 0:
+        log.info("No lexical matches found for feature extraction.")
+        return
+
+    log.info("Running extraction pipeline on %d lexical matches...", len(lexical))
+    cse_records = load_cse_records()
+    cse_domains = load_cse_domains(cse_records)
+    token_map = get_token_mapping(cse_records)
+
+    contexts = []
+    for row_index, row in lexical.iterrows():
+        url = "" if pd.isna(row["url"]) else str(row["url"]).strip()
+        token = "" if pd.isna(row["cse"]) else str(row["cse"]).strip()
+        if not url:
+            continue
+
+        cse_record = token_map.get(token)
+        domain, _, _ = parse(url)
+
+        ctx = UrlContext(
+            url=url,
+            detected_domain=domain,
+            target_domain=cse_record.domain if cse_record else "",
+            cse_name=cse_record.name if cse_record else token,
+            source_label="Unlabeled",
+            source_file=lexical_source,
+            source_row=int(row_index) + 2,
+        )
+        contexts.append(ctx)
+
+    if not contexts:
+        log.info("No valid lexical rows found for feature extraction.")
+        return
+
+    run_extraction_pipeline(contexts, cse_domains)
+
+    # Generate evidence screenshots + final xlsx report
+    try:
+        from extract import evidence_generator
+        report_path = evidence_generator.generate_report(output_dir=output_folder)
+        if report_path:
+            log.info("Final phishing report: %s", report_path)
+    except Exception as e:
+        log.error("Failed to generate evidence report: %s", e)
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="Phishing Lexical Detector")
     parser.add_argument("--input-data", help="Path to input data directory or file", default=None)
     parser.add_argument("--lexical-only", action="store_true", help="Only run the lexical matching phase, skip feature extraction")
+    parser.add_argument(
+        "--start-at",
+        choices=["lexical", "feature-extraction"],
+        default="lexical",
+        help="Pipeline stage to start at. Use 'feature-extraction' to reuse an existing lexical CSV.",
+    )
+    parser.add_argument(
+        "--lexical-input",
+        default=os.path.join(output_folder, "lexical.csv"),
+        help="Path to lexical matches CSV when starting at feature extraction (default: output/lexical.csv).",
+    )
     args = parser.parse_args()
 
-    from run_pipeline import run_extraction_pipeline, load_cse_records, load_cse_domains
-    from extract.feature_extractor import UrlContext
+    if args.lexical_only and args.start_at == "feature-extraction":
+        parser.error("--lexical-only cannot be used with --start-at feature-extraction")
+
+    if args.start_at == "feature-extraction":
+        if args.input_data:
+            log.warning("--input-data is ignored when --start-at feature-extraction; use --lexical-input for lexical CSV input.")
+        try:
+            lexical = load_lexical_matches(args.lexical_input)
+        except (OSError, ValueError) as e:
+            log.error("%s", e)
+            return
+        run_feature_extraction_for_lexical(lexical, os.path.basename(args.lexical_input))
+        return
     
     cse_domains_set = load_cse(cse_folder)
     log.info("Loaded %d CSE whitelist domains", len(cse_domains_set))
@@ -715,7 +845,7 @@ def main():
 
     # Load target URLs
     targets = []
-    DOMAIN_COL_NAMES = {"domain_name", "domains","domain" "url", "urls", "domain_domain"}
+    DOMAIN_COL_NAMES = {"domain_name", "domains", "domain", "url", "urls", "domain_domain"}
 
     target_paths = []
     if args.input_data:
@@ -782,10 +912,13 @@ def main():
     
     results = []
     chunksize = max(1, len(targets) // (workers * 4))
+    chunks = [targets[i:i + chunksize] for i in range(0, len(targets), chunksize)]
+    log.info("Split %d URLs into %d chunks (chunksize=%d)", len(targets), len(chunks), chunksize)
+    
     with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as executor:
-        futures = [executor.submit(classify, u, cse_domains_set) for u in targets]
-        for future in tqdm(concurrent.futures.as_completed(futures), total=len(targets), desc="Lexical Match"):
-            results.append(future.result())
+        futures = [executor.submit(classify_chunk, chunk, cse_domains_set) for chunk in chunks]
+        for future in tqdm(concurrent.futures.as_completed(futures), total=len(chunks), desc="Lexical Match"):
+            results.extend(future.result())
     df = pd.DataFrame(results)
 
     # Split: lexical matches vs everything else
@@ -801,40 +934,9 @@ def main():
         if args.lexical_only:
             log.info("Skipping feature extraction phase due to --lexical-only flag.")
         else:
-            log.info("Running extraction pipeline on %d lexical matches...", len(lexical))
-            cse_records = load_cse_records()
-            cse_domains = load_cse_domains(cse_records)
-            token_map = get_token_mapping(cse_records)
-            
-            contexts = []
-            for _, row in lexical.iterrows():
-                token = row['cse']
-                cse_record = token_map.get(token)
-                
-                # Use original URL to preserve http/https, else parse and construct
-                url = row['url']
-                domain, _, _ = parse(url)
-                
-                ctx = UrlContext(
-                    url=url,
-                    detected_domain=domain,
-                    target_domain=cse_record.domain if cse_record else "",
-                    cse_name=cse_record.name if cse_record else token,
-                    source_label="Unlabeled",
-                    source_file="main_detector_targets",
-                )
-                contexts.append(ctx)
-                
-            run_extraction_pipeline(contexts, cse_domains)
-    
-            # Generate evidence screenshots + final xlsx report
-            try:
-                from extract import evidence_generator
-                report_path = evidence_generator.generate_report(output_dir=output_folder)
-                if report_path:
-                    log.info("Final phishing report: %s", report_path)
-            except Exception as e:
-                log.error("Failed to generate evidence report: %s", e)
+            run_feature_extraction_for_lexical(lexical)
+    elif not args.lexical_only:
+        log.info("No lexical matches found; feature extraction phase not started.")
 
 if __name__ == "__main__":
     main()
