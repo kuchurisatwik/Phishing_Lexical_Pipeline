@@ -347,9 +347,11 @@ def _url_alnum(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", f"{parsed.hostname or ''} {parsed.path}".lower())
 
 def _first(row: pd.Series, *columns: str) -> str:
+    col_map = {str(k).lower().strip(): k for k in row.index}
     for column in columns:
-        if column in row.index:
-            value = _cell(row[column])
+        col_lower = column.lower().strip()
+        if col_lower in col_map:
+            value = _cell(row[col_map[col_lower]])
             if value:
                 return value
     return ""
@@ -450,9 +452,9 @@ def load_input_contexts(input_dir: str) -> list[UrlContext]:
                 df = pd.DataFrame({"url": values})
             elif file_name.lower().endswith(".csv"):
                 try:
-                    df = pd.read_csv(path, encoding="utf-8-sig")
+                    df = pd.read_csv(path, encoding="utf-8-sig", low_memory=False)
                 except UnicodeDecodeError:
-                    df = pd.read_csv(path, encoding="latin1")
+                    df = pd.read_csv(path, encoding="latin1", low_memory=False)
             else:
                 csv_path = path.rsplit('.', 1)[0] + ".csv"
                 if not os.path.exists(csv_path):
